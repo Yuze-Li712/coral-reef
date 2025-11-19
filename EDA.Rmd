@@ -1,0 +1,396 @@
+---
+title: "Exploratory Data Analysis"
+author: "DATA3888-Reef09"
+date: "2025-03-30"
+output: html_document
+---
+
+# Exploring the Reef Data
+
+In this section, we will join the datasets our group has chosen to look at and make some basic visualisations to explore the data and look for any initial patterns.
+
+```{r, warning=FALSE, message=FALSE}
+library(terra)
+library(tidyverse)
+library(ggspatial)
+library(dplyr)
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(patchwork) 
+library(gganimate)
+```
+
+
+## Loading the Datasets
+
+First, we will load the *Queensland Landuse Dataset*. 
+
+```{r}
+landuse <- terra::vect("/Users/stephdunn/Documents/Uni/Year 5 S1/DATA3888/DATA3888-Reef09/data/farms_data/QLD_GBRLANDUSE_2021.gdb")
+
+landuse_df <- as.data.frame(landuse, geom = "WKT")  # For points
+
+landuse_sf <- st_as_sf(landuse)  # Convert to 'sf' object instead of 'terra' object
+landuse_sf <- st_transform(landuse_sf, crs = 4326)
+```
+
+```{r}
+# Filter for sugar farms only
+landuse_sugar <- landuse_sf %>%
+  filter(Tertiary == "Sugar" | Tertiary == "Irrigated sugar") %>% # | is the or operator over vectors
+  mutate(id = row_number())
+
+coords <- landuse_sugar %>%
+  st_cast("POLYGON") %>%
+  st_coordinates() %>%
+  as.data.frame() %>%
+  rename(long = X, lat = Y) %>%
+  mutate(id = L1, group = paste(L1, L2, sep = "."))
+
+australia <- ne_countries(scale = "medium", country = "Australia", returnclass = "sf")
+
+ggplot() +
+  geom_sf(data = australia, fill = "gray95", color = "gray80") +
+  geom_sf(data = landuse_sugar, aes(color = Tertiary, fill = Tertiary)) +
+  coord_sf(xlim = c(140, 155), ylim = c(-30, -12), expand = FALSE) +  # bounds for Queensland (approximate)
+  theme_minimal() +
+  labs(title = "Sugar Land Use near Great Barrier Reef")
+```
+
+
+Next, we will load the AIMs dataset containing the COTS data. This data is stored in a CSV file so it is a little bit easier to parse.
+
+```{r, warning=FALSE}
+cots <- read_csv("/Users/stephdunn/Documents/Uni/Year 5 S1/DATA3888/DATA3888-Reef09/data/cots_data/manta-tow-by-reef.csv")
+
+head(cots)
+colnames(cots)
+```
+
+```{r}
+p1 <- ggplot(cots, aes(x = LONGITUDE, y = LATITUDE)) +
+  borders("world", regions = "Australia", fill = "gray95", colour = "gray80") +
+  geom_point(aes(size = MEAN_COTS_PER_TOW, color = MEAN_COTS_PER_TOW), alpha = 0.7) +
+  scale_color_viridis_c(option = "plasma", name = "COTS per Tow") +
+  scale_size_continuous(name = "COTS per Tow", range = c(1, 6)) +
+  coord_fixed(xlim = c(142, 155), ylim = c(-25, -10), expand = FALSE) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 10)) + 
+  labs(
+    title = "Mean COTS per Tow",
+    x = "Longitude",
+    y = "Latitude"
+  )
+
+p2 <- ggplot(cots, aes(x = LONGITUDE, y = LATITUDE)) +
+  borders("world", regions = "Australia", fill = "gray95", colour = "gray80") +
+  geom_point(aes(size = TOTAL_COTS, color = TOTAL_COTS), alpha = 0.7) +
+  scale_color_viridis_c(option = "plasma", name = "Total COTS") +
+  scale_size_continuous(name = "Total COTS", range = c(1, 6)) +
+  coord_fixed(xlim = c(142, 155), ylim = c(-25, -10), expand = FALSE) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 10)) + 
+  labs(
+    title = "Total COTs",
+    x = "Longitude",
+    y = "Latitude"
+  )
+
+p1 + p2 # patchwork library will put the plots side by side
+```
+
+Looking above, we can see that the COTS data is quite sparse, with some areas having a lot of COTS and others having none. We can see that high COTS per tow lines up with a high number of total COTS.
+
+## Putting the Datasets Together
+
+```{r}
+# excluding zeroes because they clutter the plot and we are interested in where the COTS are
+cots_excluding_zeros = cots %>%
+  filter(TOTAL_COTS > 0) %>%
+  mutate(id = row_number()) %>%
+  mutate(COTS_BIN = cut(
+    TOTAL_COTS,
+    breaks = c(0, 100, 500, 1000, 1500, Inf),
+    labels = c("0–100", "101–500", "501–1000", "1001–1500", "1500+")
+  ))
+
+ggplot() +
+  geom_sf(data = australia, fill = "gray95", color = "gray80") +
+  geom_sf(data = landuse_sugar, aes(fill = Tertiary), color = NA) +
+  geom_point(data = cots_excluding_zeros, aes(x = LONGITUDE, y = LATITUDE, size = COTS_BIN, color = COTS_BIN), alpha = 0.7) +
+  
+  # Scales for COTS to prevent two separate legends coming up for both size and colour
+  scale_color_manual(values = c("#fff275", "#5dc963", "#21908d", "#3b528b", "#440154")) +
+  scale_size_manual(values = c(1, 2, 3, 4, 5)) +
+  guides(
+    color = guide_legend(title = "Total COTS"),
+    size = guide_legend(title = "Total COTS")
+  ) +
+
+  coord_sf(xlim = c(140, 155), ylim = c(-30, -10), expand = FALSE) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 12),
+    legend.position = "right"
+  ) +
+  labs(
+    title = "Crown-of-Thorns Starfish & Sugar Land Use near the Great Barrier Reef",
+    x = "Longitude",
+    y = "Latitude",
+    fill = "Land Use"
+  )
+```
+
+Interestingly, it does seem like there are more COTs concentrated in regions of the reef off the sugar farms! For irrigated sugar farms, it doesn't seem like as strong of an effect. 
+
+```{r}
+# filter COTS data to only include coordinates within 1km of coastline
+cots_sf <- st_as_sf(cots, coords = c("LONGITUDE", "LATITUDE"), crs = 4326) # WGS84
+coast <- ne_download(scale = "medium", type = "coastline", category = "physical", returnclass = "sf")
+cots_sf_proj <- st_transform(cots_sf, 3112)
+coast_proj <- st_transform(coast, 3112)
+
+# Calculate distances
+distances <- st_distance(cots_sf_proj, coast_proj)
+
+# Find minimum distance to coast for each point
+min_dists <- apply(distances, 1, min)
+
+# Filter points within 1000 m
+cots_near_coast <- cots_sf_proj[min_dists <= 30 * 1000, ]
+
+ggplot(cots_near_coast) +
+  geom_sf(aes(color = TOTAL_COTS, size = TOTAL_COTS), alpha = 0.7) +
+  scale_color_viridis_c(option = "plasma", name = "Total COTS") +
+  scale_size_continuous(name = "Total COTS", range = c(1, 6)) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 10)) +
+  labs(
+    title = "COTS within 20km of Coastline",
+    x = "Longitude",
+    y = "Latitude"
+  )
+```
+
+```{r}
+cots_wgs84 <- st_transform(cots_near_coast, 4326)
+
+# Get a map of Australia
+australia <- ne_countries(scale = "medium", country = "Australia", returnclass = "sf")
+
+# Plot
+ggplot() +
+  geom_sf(data = australia, fill = "gray95", color = "gray80") +
+  geom_sf(data = cots_wgs84, aes(color = TOTAL_COTS, size = TOTAL_COTS), alpha = 0.7) +
+  geom_sf(data = landuse_sugar, aes(fill = Tertiary), color = NA) +
+  scale_color_viridis_c(option = "plasma", name = "Total COTS") +
+  scale_size_continuous(name = "Total COTS", range = c(1, 6)) +
+  coord_sf(xlim = c(142, 151), ylim = c(-22.5, -12.5), expand = FALSE) +  # flat projection
+  theme_minimal() +
+  theme(plot.title = element_text(size = 10)) +
+  labs(
+    title = "COTS within 20km of Coastline",
+    x = "Longitude",
+    y = "Latitude"
+  )
+```
+
+```{r}
+cots_wgs84$REPORT_YEAR <- as.factor(cots_wgs84$REPORT_YEAR)
+
+# Base plot
+p <- ggplot() +
+  geom_sf(data = australia, fill = "gray95", color = "gray80") +
+  geom_sf(data = landuse_sugar, aes(fill = Tertiary), color = NA, alpha = 0.5) +
+  geom_sf(data = cots_wgs84, aes(color = TOTAL_COTS, size = TOTAL_COTS), alpha = 0.8) +
+  scale_color_viridis_c(option = "plasma", name = "Total COTS") +
+  scale_size_continuous(name = "Total COTS", range = c(1, 6)) +
+  coord_sf(xlim = c(142, 151), ylim = c(-22.5, -12.5), expand = FALSE) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 12),
+    legend.position = "right"
+  ) +
+  labs(
+    title = "COTS within 20km of Coastline — Year: {closest_state}",
+    x = "Longitude",
+    y = "Latitude"
+  ) +
+  transition_states(REPORT_YEAR, transition_length = 1, state_length = 1) +
+  ease_aes('linear')
+
+# Animate
+animate(p, width = 800, height = 600, fps = 2, duration = 10, renderer = gifski_renderer("cots_animation.gif")) 
+```
+
+
+## Reading in the Clean Water Dataset
+
+```{r}
+# Define the directory
+data_dir <- "/Users/stephdunn/Documents/Uni/Year 5 S1/DATA3888/DATA3888-Reef09/data/clean_water_data/"
+
+# Get list of files
+files <- list.files(data_dir, pattern = "\\.csv$", full.names = TRUE)
+
+clean_water_data <- map_dfr(files, function(file) {
+  location <- str_extract(basename(file), "(?<=\\])_?([a-z0-9]+)(?=\\.csv)") %>%
+    str_remove("^_")
+  
+  read_csv(file, col_types = cols(.default = "c")) %>%
+    mutate(location = location)
+})
+
+glimpse(clean_water_data)
+```
+
+We wish to filter to only recordings for substances relevant to COTs outbreaks.
+
+```{r}
+key_analytes <- c(
+  "Oxidised nitrogen as N",
+  "Filterable Reactive phosphorus as P",
+  "Total suspended solids",
+  "Diuron",
+  "Atrazine"
+)
+
+cots_impact_data <- clean_water_data %>%
+  filter(Analyte %in% key_analytes)
+
+glimpse(cots_impact_data)
+```
+
+```{r}
+cots_map_data <- clean_water_data %>%
+  filter(Analyte %in% key_analytes) %>%
+  mutate(
+    Value_numeric = as.numeric(str_remove_all(Value, "[^0-9\\.]+")), # remove non-numeric characters
+    Latitude = as.numeric(Latitude),
+    Longitude = as.numeric(Longitude),
+    Analyte = factor(Analyte)
+  ) %>%
+  drop_na(Value_numeric, Latitude, Longitude)
+```
+
+```{r}
+australia <- ne_countries(scale = "medium", country = "Australia", returnclass = "sf")
+
+analyte_labels <- c(
+  "Oxidised nitrogen as N" = "NOx",
+  "Filterable Reactive phosphorus as P" = "FRP",
+  "Total suspended solids" = "TSS",
+  "Diuron" = "Diuron",
+  "Atrazine" = "Atrazine"
+)
+
+# Function to generate one map per analyte
+plot_analyte_map <- function(analyte_name) {
+  df <- cots_map_data %>% filter(Analyte == analyte_name)
+
+  ggplot() +
+    geom_sf(data = australia, fill = "gray95", color = "gray80") +
+    geom_point(
+      data = df,
+      aes(x = Longitude, y = Latitude, color = Value_numeric, size = Value_numeric),
+      alpha = 0.65
+    ) +
+    scale_color_viridis(option = "plasma", name = "Concentration") +
+    scale_size_continuous(range = c(1, 6), guide = "none") +
+    coord_sf(xlim = c(140, 155), ylim = c(-30, -10), expand = FALSE) +
+    theme_minimal(base_size = 12) +
+    labs(
+      title = paste("Spatial Distribution of", analyte_labels[analyte_name]),
+      x = "Longitude",
+      y = "Latitude"
+    )
+}
+
+# Create each map
+p_atrazine <- plot_analyte_map("Atrazine")
+p_diuron <- plot_analyte_map("Diuron")
+p_frp <- plot_analyte_map("Filterable Reactive phosphorus as P")
+p_tss <- plot_analyte_map("Total suspended solids")
+p_din <- plot_analyte_map("Oxidised nitrogen as N")
+
+p_atrazine
+p_diuron
+p_frp
+p_tss
+p_din
+```
+```{r}
+# Subset COTS and landuse 
+cots_layer <- cots %>%
+  filter(TOTAL_COTS > 0) %>%
+  mutate(REPORT_YEAR = as.integer(REPORT_YEAR)) %>%
+  drop_na(LONGITUDE, LATITUDE)
+
+# Use the same labels
+analyte_labels <- c(
+  "Oxidised nitrogen as N" = "NOx",
+  "Total suspended solids" = "TSS"
+)
+
+# Function for each focused analyte + overlays
+plot_overlay_map <- function(analyte_name) {
+  df <- cots_map_data %>% filter(Analyte == analyte_name)
+
+  ggplot() +
+    geom_sf(data = australia, fill = "gray95", color = "gray80") +
+
+    geom_sf(
+      data = landuse_sf,
+      fill  = "forestgreen",
+      color = NA,
+      alpha = 0.3
+    ) +
+
+    geom_point(
+      data = df,
+      aes(x = Longitude, y = Latitude,
+          color = Value_numeric,
+          size  = Value_numeric),
+      alpha = 0.75
+    ) +
+
+    geom_point(
+      data = cots_layer,
+      aes(x = LONGITUDE, y = LATITUDE,
+          fill = TOTAL_COTS),
+      shape  = 21,
+      color  = "black",
+      stroke = 0.3,
+      size   = 2.5,
+      alpha  = 0.6
+    ) +
+
+    # Continuous scales
+    scale_color_viridis(
+      option = "plasma",
+      name   = expression("Analyte Conc")
+    ) +
+    scale_fill_viridis(
+      option = "magma",
+      name   = expression("COTS Count")
+    ) +
+    scale_size_continuous(range = c(1, 6), guide = "none") +
+
+    coord_sf(xlim = c(140, 155), ylim = c(-30, -10), expand = FALSE) +
+
+    theme_minimal(base_size = 13) +
+    labs(
+      title = paste("COTS & Sugar Land Use +", analyte_labels[analyte_name]),
+      x     = "Longitude",
+      y     = "Latitude"
+    )
+}
+
+p_nox <- plot_overlay_map("Oxidised nitrogen as N")
+p_tss <- plot_overlay_map("Total suspended solids")
+
+p_nox
+p_tss
+```
+
