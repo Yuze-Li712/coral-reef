@@ -1,0 +1,842 @@
+---
+title: "Predicting COTS Outbreaks: A Lizard Island Case Study"
+author: "Reef09"
+output: 
+  html_document:
+    embed_resources: true
+    code_folding: hide
+    theme: cerulean
+    highlight: tango
+    toc: true
+    toc_float: true
+    includes:
+      in_header: latex-font.html
+---
+
+```{r include=FALSE}
+knitr::opts_chunk$set(
+  message  = FALSE,
+  warning  = FALSE,
+  cache    = TRUE,
+  fig.path = "figures/"
+)
+
+library(tidyverse)
+library(sf)
+library(ncdf4)
+library(CFtime)
+library(dggridR)
+library(caret)
+library(kableExtra)
+library(htmltools)
+
+set.seed(3888) # for reproducibility
+```
+
+# Executive Summary
+Crown-of-Thorns Starfish (COTS) are a major cause of coral loss and ecosystem degradation on the Great Barrier Reef (GBR). This report investigates the relationship between water quality and COTS outbreaks in the Lizard Island region, using datasets from AIMS and eReefs. We focused on four key environmental indicators: chlorophyll-a, dissolved inorganic nitrogen (DIN), phosphorus (DIP), and dissolved inorganic carbon (DIC).
+
+We trained and evaluated four predictive models and selected ordinal logistic regression as the final model based on its strong local performance, balanced sensitivity across outbreak classes, and interpretability. A SHAP analysis of model outputs identified high DIN and chlorophyll-a as key predictors of outbreaks, supporting Birkeland’s *'Terrestrial Run-off Hypothesis'* (1982), where nutrient enrichment enhances larval survival. Unexpectedly, DIP did not strongly predict outbreaks, likely due to nutrient limitation dynamics. DIC showed an inverse relationship with outbreak risk, which may reflect interactions with other environmental variables.
+
+The model was deployed through an interactive Shiny app, enabling users such as the Great Barrier Reef Marine Park Authority (GBRMPA) to explore outbreak risk under different environmental conditions. This tool supports real-time decision-making and reflects known ecological processes described by the Initiation Box Theory, which explains the role of Lizard Island as a recurrent outbreak origin point.
+
+This work demonstrates how ecological knowledge and data science can be integrated into a practical tool for reef management. It also highlights the importance of addressing land-based nutrient runoff and agricultural expansion for preventing future COTS outbreaks.
+
+# Aim and Background 
+Crown-of-thorns starfish (COTS) pose a growing threat to coral reefs globally. These large invertebrates feed on healthy coral and drive widespread coral mortality (Miller, 2002; GBRMPA, 2025). When COTS outbreaks occur, they cause extensive coral degradation that undermines reef structure, biodiversity, and ecological resilience. On Australia’s Great Barrier Reef (GBR), two major outbreaks in the past 30 years have spread southward in repeated waves, disrupting recovery and ecosystem function (Pratchett et al., 2014).
+
+These COTS outbreaks have coincided with long-term declines in water quality on the Great Barrier Reef, largely driven by agricultural intensification since European settlement (Kroon, 2012; Waltham et al., 2021). Runoff enriched with nitrogen and phosphorus disrupts the reef's naturally oligotrophic (nutrient-poor) conditions, fuelling algal blooms (Walther et al., 2013; Baird et al., 2021).  These blooms provide a critical food source for COTS larvae, increasing their survival and enabling rapid population growth (Patel et al., 2024). Once outbreaks begin, COTS’ ecological plasticity allows them to persist across a range of nutrient conditions (Caballes et al., 2017; Li et al., 2023), further threatening reef health.
+
+While nutrient runoff is a key driver (Brodie et al., 2017; Fabricius et al., 2010), outbreaks likely result from multiple interacting factors, including water quality, larval dispersal patterns, and reef structure (Matthews et al., 2020; Patel et al., 2024). Birkland’s *‘Terrestrial Run-off Hypothesis’* (1982) remains a central theory, proposing that heavy rainfall events increase terrestrial nutrient input to coastal waters, driving phytoplankton blooms that boost COTS larval survival rates (Deaker & Byrne, 2022). 
+
+Our study focuses on **Lizard Island**, a site repeatedly identified as an outbreak initiation zone (Pratchett, 2005; Wooldridge and Brodie, 2015). According to the *‘Initiation Box Theory’*, specific oceanographic conditions such as larval retention and nutrient enrichment make this region particularly favourable for COTS recruitment and early population growth (Babcock et al., 2020). 
+
+This project aims to:
+
+1. Investigate how fluctuations in water quality measures relate to the onset and severity of COTS outbreaks in the Lizard Island region
+
+2. Develop and validate a predictive model that uses these environmental indicators to predict the risk of future COTS outbreaks.
+
+# Method
+## Marine Science 
+### Data collection 
+
+#### COTS Abundance and Coral Health
+Data on COTS abundance and coral health was obtained from the Australian Institute of Marine Science (AIMS) Long-Term Monitoring Program, comprising 2,646 observations between the years 1993-2023. From 1993-2006, surveys were conducted annually, and from 2006 onward, every second year. Trained spotters were towed on manta boards along fixed transects on the reef crest for two-minute intervals, recording the number and size class of COTS individuals, percentage cover of live and dead hard coral, soft coral and presence of feeding scars (AIMS, 2025). 
+
+```{r}
+#| code-summary: "COTS dataset"
+# load COTS data and rename columns
+cots.data = read.csv("data/cots_data/manta-tow-by-reef.csv") %>% 
+  dplyr::rename(long = LONGITUDE, 
+         lat = LATITUDE, 
+         date = SAMPLE_DATE, 
+         ttl_cots = TOTAL_COTS, 
+         num_tows = TOWS, 
+         mean_cots_per_tow = MEAN_COTS_PER_TOW,
+         live_coral = MEAN_LIVE_CORAL, 
+         soft_coral = MEAN_SOFT_CORAL, 
+         dead_coral = MEAN_DEAD_CORAL) %>% 
+  dplyr::mutate(
+      date = as.Date(date, format = "%Y-%m-%d"), 
+      year = year(date)) %>% 
+  dplyr::select(date, year, long, lat, ttl_cots, mean_cots_per_tow, num_tows, live_coral, soft_coral, dead_coral) %>% 
+  dplyr::filter(year > 2009) # to match time scale of ereefs, which starts in 2019
+```
+
+#### Water Quality
+Environmental data were sourced from eReefs, using remote-sensing ocean colour radiometry (OCR) to estimate surface water quality across the GBR. From 2010-2019, 1.4 million marine water quality scores were collected annually for the GBR Report Cards. This included data on chlorophyll-a concentration, dissolved inorganic nitrogen (DIN), dissolved inorganic phosphorus (DIP), and dissolved inorganic carbon (DIC).
+
+```{r}
+#| code-summary: "eReefs dataset"
+
+# fetch eReefs data from the THREDDS server
+ereefs.nc = nc_open("https://thredds.ereefs.aims.gov.au/thredds/dodsC/GBR4_H2p0_B3p1_Cq3b_Dhnd/annual.nc")
+
+lat = ncdf4::ncvar_get(ereefs.nc, "latitude")
+long = ncdf4::ncvar_get(ereefs.nc, "longitude")
+
+time = ncdf4::ncvar_get(ereefs.nc, "time")
+tunits = ncdf4::ncatt_get(ereefs.nc, "time", "units")
+cf = CFtime::CFtime(tunits$value, calendar = "standard", time)  # convert time to CFtime class
+timestamps = CFtime::as_timestamp(cf)  # get character-string times
+timestamps = as.Date(timestamps, format = "%Y-%m-%d")  # convert string to date object
+depth = ncdf4::ncvar_get(ereefs.nc, "zc")
+```
+
+### Variable selection 
+
+To guide variable selection, we reviewed literature on COTS outbreaks and coral reef health on the GBR. Based on this, we selected four biogeochemical variables: DIC, DIN, DIP, and chlorophyll-a, chosen for their documented roles in coral resilience and COTS population dynamics (Baird et al. 2021, Brodie et al., 2017; Patel et al., 2024).
+ 
+* **DIC** supports coral calcification by enabling corals to regulate pH and aragonite saturation. Lower DIC levels reduce skeletal integrity and make corals more vulnerable to damage (Allison et al., 2014). Under the *'reef degradation hypothesis'*, weakened coral structures also create rubble habitats that support COTS recruitment (Wolfe & Byrne, 2024).
+
+* **DIN**, primarily from agricultural runoff, drives phytoplankton blooms, which provide food for COTS larvae and increase survival rates  (Kroon et al., 2023; Patel et al., 2024). While moderate levels of DIN can support coral health by nourishing the symbiotic algae that live within coral tissue (Li et al., 2023), excessive nutrient enrichment disrupts this balance and favours opportunistic species like COTS.
+
+* **DIP** has also increased with agricultural activity, with an estimated 7100 tonnes entering the GBR each year (AIMS, 2024). Like DIN, it promotes primary productivity (the growth of phytoplankton and other photosynthetic organisms at the base of the marine food web) indirectly supporting larval growth via algal blooms. 
+
+* **Chlorophyll-a** was included as a proxy for phytoplankton biomass, providing a quantifiable indicator of recent nutrient inputs. Elevated levels are strongly associated with higher COTS larval survival  (Miles et al., 2013) and consequently can be considered a reliable marker of outbreak risk.
+
+```{r}
+#| code-summary: "eReefs Environmental Variables"
+
+# Get key variables for our analysis
+dic = ncdf4::ncvar_get(ereefs.nc, "DIC") # Dissolved Inorganic Carbon
+din = ncdf4::ncvar_get(ereefs.nc, "DIN") # Dissolved Inorganic Nitrogen
+dip = ncdf4::ncvar_get(ereefs.nc, "DIP") # Dissolved Inorganic Phosphurus
+chlorophyll = ncdf4::ncvar_get(ereefs.nc, "Chl_a_sum") #Chlorophyll
+
+# Create a data frame with all variables
+ereefs.data = expand.grid(long = long, lat = lat, time = timestamps, depth = as.vector(depth)) %>% 
+  dplyr::mutate(
+    dic = as.vector(dic), 
+    dip = as.vector(dip), 
+    din = as.vector(din), 
+    chlorophyll = as.vector(chlorophyll)
+    ) %>% 
+  dplyr::filter(!is.na(din)) %>% 
+  dplyr::group_by(lat, long, time) %>% 
+  dplyr::slice_min(depth) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::mutate(year = year(time)) %>% 
+  dplyr::rename(date = time)
+```
+
+## Data Science
+Our data science workflow is summarised in Figure 1. We began by integrating COTS abundance and water quality datasets across both space and time. To standardise spatial resolution, we applied a 260 square kilometre hexagonal grid across the Great Barrier Reef and aggregated all data at the hexagon-year level. Within each cell, we calculated the mean values of the environmental variables (DIN, DIP, DIC and chlorophyll-a) as well as live coral cover. COTS data were standardised by summing the number of individuals and tows within each hexagon, and then computing COTS per tow.
+
+```{r, warning = FALSE, cache= TRUE, message= FALSE, results = "hide"}
+#| code-summary: "Building Hexagon Map"
+dggs <- dgconstruct(area = 260, metric = TRUE, resround = "nearest") # construct a DGGS grid with 260 km² hexagons
+ereefs.sf = st_as_sf(ereefs.data, coords= c("long", "lat"), crs = 4326) # convert to sf object
+gbr_boundary = (st_bbox(ereefs.sf)) # get the bounding box of the GBR area
+
+gbr_boundary_matrix = matrix(c(
+  gbr_boundary[["xmin"]], gbr_boundary[["ymin"]],
+  gbr_boundary[["xmin"]], gbr_boundary[["ymax"]],
+  gbr_boundary[["xmax"]], gbr_boundary[["ymax"]],
+  gbr_boundary[["xmax"]], gbr_boundary[["ymin"]],
+  gbr_boundary[["xmin"]], gbr_boundary[["ymin"]]),
+  ncol = 2, byrow = TRUE)
+
+# convert the bounding box to a polygon
+gbr_shp = st_as_sf(st_sfc(st_polygon(list(gbr_boundary_matrix))))
+
+# generate the hexagonal grid for the GBR area
+gbr_grid = dgshptogrid(dggs, gbr_shp)
+
+# assign hexagon IDs to eReefs data
+ereefs.hexa.sf <- st_join(ereefs.sf, gbr_grid, join = st_within, left = TRUE) %>%
+  as.data.frame() %>%
+  select(!geometry) %>%
+  group_by(seqnum, year) %>%
+  summarise(dic = mean(dic),
+            dip = mean(dip), 
+            din = mean(din), 
+            chlorophyll = mean(chlorophyll),
+            .groups = 'drop') %>%
+  left_join( # join the hexagon spatial data
+    y = as.data.frame(gbr_grid),
+    by = "seqnum"
+  ) %>% 
+  st_as_sf()
+```
+
+We then binned these values into four ordinal outbreak categories, defined in accordance with AIMS thresholds: no outbreak, potential outbreak, outbreak, and severe outbreak. The resulting dataset comprised one row per hexagon-year, with corresponding environmental predictors and outbreak severity labels.
+
+<div style="text-align: center;">
+  <img src="figures/model-schematic.jpg" width="70%" alt="Figure 1. Flowchart showing a summary of the Data Science workflow to select the final model for deployment.">
+  <p><strong>Figure 1.</strong> Flowchart depicting Data Science Method.</p>
+</div>
+
+
+```{r}
+#| code-summary: "Spatial & Temporal Join with COTS dataset"
+cots.sf = st_as_sf(cots.data, coords= c("long", "lat"), crs = 4326)
+years = seq(0:9) + 2009 # years from 2010 to 2019
+x = list() 
+
+# Loop through each year to spatially join COTS and eReefs data
+for(i in 1: length(years)){
+  cots.sf.partition = cots.sf %>% filter(year == years[i])
+  ereefs.sf.partition = ereefs.hexa.sf %>% filter(year == years[i])
+  
+  sf.partition = st_join(cots.sf.partition, ereefs.sf.partition, join = st_within, left=TRUE) %>% 
+    as.data.frame() %>% 
+    dplyr::select(!geometry, !date, !year.y) %>% # geometry removed because sites are referenced by their hexagon
+    dplyr::rename(year = year.x) %>% 
+    dplyr::group_by(seqnum, year) %>% 
+    dplyr::summarise(
+      ttl_cots = sum(ttl_cots), 
+      num_tows = sum(num_tows), 
+      live_coral = mean(live_coral), 
+      .groups = 'drop'
+    )
+  
+  x[[i]] = sf.partition  # Store yearly summary
+}
+temp.df = bind_rows(x)
+
+# Join the summarised COTS data with the hexagon-based eReefs data
+# and calculate mean COTS per tow for each hexagon-year
+map.sf = dplyr::left_join(
+  x = as.data.frame(ereefs.hexa.sf), 
+  y = temp.df, 
+  by = c("seqnum", 'year')) %>% 
+  dplyr::mutate(mean_cots = ttl_cots/num_tows) %>% 
+  sf::st_as_sf() # Convert back to sf object
+```
+
+### Model Development
+We trained four candidate models to predict both the likelihood and severity of COTS outbreaks:
+
+* **k-Nearest Neighbours (kNN):** A non-parametric method that classifies each observation based on the majority label of its k most similar neighbours. We tested values of k from 3 to 15 and found that 3-NN performed best.
+
+* **Random Forest:** An ensemble model built from 500 decision trees trained on bootstrapped data subsets. We capped trees at 30 terminal nodes and required a minimum of 5 samples per node to avoid overfitting. The model outputs class probabilities by averaging predictions across all trees.
+
+* **Support Vector Machine (SVM):** This model identifies optimal decision boundaries in a multi-dimensional feature space. Predictor variables were standardised (centered and scaled) to ensure equal contribution to the decision surface.
+
+* **Ordinal Logistic Regression:** This model was selected specifically for its ability to model ordered categorical outcomes. It estimates the probability of each hexagon-year falling into one of the four outbreak severity levels.
+
+All models were trained using 5-fold cross-validation, where the dataset is split into five equal parts. Each model was trained on 80% of the data and validated on the remaining 20%, rotating through all partitions. The model was trained on all hexagonal regions for the entire Great Barrier Reef to ensure we had enough data to learn meaningful patterns. Accounting for predictive accuracy on the Lizard Island region was accounted for during evaluation, which will be explored in the next section.
+
+
+```{r}
+#| code-summary: "Model Training"
+set.seed(3888)
+
+# clean and prepare the data
+df = map.sf %>% 
+  sf::st_drop_geometry() %>% 
+  dplyr::filter(!is.na(mean_cots)) %>% 
+  dplyr::mutate(
+    mean_cots = as.factor(case_when(
+        mean_cots < 0.1 ~ "no.outbreak", 
+        mean_cots >= 0.1 & mean_cots < 0.22 ~ "potential.outbreak", 
+        mean_cots >= 0.22 & mean_cots < 1 ~ "outbreak", 
+        mean_cots >= 1 ~ "severe.outbreak")), 
+    logdin = log(din + 1), 
+    logdip = log(dip + 1), 
+    sqrtchlorophyll = sqrt(chlorophyll)
+  ) 
+
+levels = c(
+    "no.outbreak",
+    "potential.outbreak",
+    "outbreak",
+    "severe.outbreak"
+  )
+
+df$mean_cots <- factor(
+  df$mean_cots,
+  levels = levels,
+  ordered = TRUE
+)
+
+ctrl <- trainControl(
+  method   = "cv",
+  number   = 5,
+  sampling = "smote",   
+  savePrediction = 'final', 
+  classProbs = TRUE, 
+  summaryFunction = multiClassSummary
+)
+
+metric = "Mean_Sensitivity"
+
+# Random Forest model
+rf_fit = train(
+  mean_cots ~ dic + logdin + logdip + sqrtchlorophyll + live_coral,
+  data      = df,
+  method    = "rf",
+  trControl = ctrl,
+  metric = metric,
+  ntree     = 500,
+  maxnodes  = 30,
+  nodesize  = 5
+)
+
+rf_cm_overall = confusionMatrix(
+  factor(rf_fit$pred$pred, levels = levels, ordered = TRUE), 
+  factor(rf_fit$pred$obs, levels = levels, ordered = TRUE)
+)
+
+# SVM model
+svm_fit <- train(
+  mean_cots ~ dic + logdin + logdip + sqrtchlorophyll + live_coral,
+  data       = df,
+  method     = "svmRadialWeights",
+  preProcess = c("center","scale"),  # SVM likes scaled data
+  trControl  = ctrl,
+  metric     = metric
+)
+
+svm_cm_overall = confusionMatrix(
+  factor(svm_fit$pred$pred, levels = levels, ordered = TRUE), 
+  factor(svm_fit$pred$obs, levels = levels, ordered = TRUE)
+)
+
+# Ordinal Logistic Regression
+ord_fit <- train(
+  mean_cots ~ dic + logdin + logdip + sqrtchlorophyll + live_coral,
+  data      = df,
+  method    = "polr",# from MASS::polr
+  trControl = ctrl,
+  metric    = metric
+)
+
+ord_cm_overall = confusionMatrix(
+  factor(ord_fit$pred$pred, levels = levels, ordered = TRUE), 
+  factor(ord_fit$pred$obs, levels = levels, ordered = TRUE)
+)
+
+# KNN model
+knn_fit <- train(
+  mean_cots ~ dic + logdin + logdip + sqrtchlorophyll + live_coral,
+  data       = df,
+  method     = "knn",
+  preProcess = c("center","scale"), # KNN needs scaling for distance measure
+  tuneGrid   = expand.grid(k = seq(3, 15, by = 2)),
+  trControl  = ctrl,
+  metric     = metric
+)
+
+
+knn_cm_overall = confusionMatrix(
+  factor(knn_fit$pred$pred, levels = levels, ordered = TRUE), 
+  factor(knn_fit$pred$obs, levels = levels, ordered = TRUE)
+)
+```
+
+We assessed each model’s ability to correctly classify outbreak severity using confusion matrices on two scales: the entire Great Barrier Reef, as well as just the hexagons intersecting a predefined bounding box for the Lizard Island region only, to ensure local performance in the case study zone we wish to make accurate predictions in. Given that around 85% of observations fall into the "no outbreak" class, we applied SMOTE resampling (Synthetic Minority Over-sampling Technique) during training. This generated synthetic samples for underrepresented classes to prevent the model from learning to predict “no outbreak” by default.
+
+Model performance was primarily assessed using confusion matrices, from which we computed sensitivity (true positive rate) for each outbreak class. We then averaged these to obtain a single mean sensitivity score for each model (see Appendix A). This approach allowed us to quantify how well each model identified outbreaks of any severity, rather than performing well only on the dominant class. As a beneficial side effect, this approach also boosts specificity for the “no outbreak” class (true negative rate), meaning the model not only catches more outbreaks but also maintains reliable performance when no outbreak is present.
+
+```{r, warning = FALSE, cache= TRUE, message= FALSE, echo= FALSE, results='hide'}
+#| code-summary: "Lizard Island"
+
+# Load the polygon defining the Lizard Island region
+lizard_polygon = st_read("data/cots_data/lizard.json")
+liz_box = st_bbox(lizard_polygon)  # bounding box
+
+# Convert COTS data to sf object and spatially filter to only points inside Lizard Island polygon
+cots.sf = cots.data %>% 
+  st_as_sf(coords = c("long", "lat"), crs = 4326) %>% 
+  st_transform(st_crs(lizard_polygon)) %>% 
+  st_join(lizard_polygon, left = FALSE)
+
+# Convert eReefs data to sf and spatially filter to Lizard polygon
+ereefs.sf = ereefs.data %>%
+  st_as_sf(coords = c("long", "lat"), crs = 4326) %>% 
+  st_transform(st_crs(lizard_polygon)) %>% 
+  st_join(lizard_polygon, left = FALSE)
+
+# aggregate eReefs and COTS variables by year
+years = seq(2009, 2018)
+x = list()
+for (i in seq_along(years)) {
+  # filter and summarise COTS data for current year
+  cots.partition = cots.sf %>% filter(year == years[i]) %>%  
+    as.data.frame() %>% 
+    summarise(
+      ttl_cots   = sum(ttl_cots), 
+      num_tows   = sum(num_tows), 
+      live_coral = mean(live_coral)
+    )
+  
+  # filter and summarise eReefs data for current year
+  ereefs.partition = ereefs.sf %>% filter(year == years[i]) %>% 
+    as.data.frame() %>%
+    summarise(
+      dic         = mean(dic), 
+      dip         = mean(dip), 
+      din         = mean(din), 
+      chlorophyll = mean(chlorophyll)
+    )
+  
+  # combine summaries and store for merging
+  temp.df = cbind(cots.partition, ereefs.partition) %>% 
+    mutate(year = years[i])
+  x[[i]] = temp.df
+}
+
+# combine all years into a single dataframe and compute mean COTS per tow
+temp.df = bind_rows(x) %>% 
+  mutate(mean_cots = ttl_cots / num_tows)
+
+# create a hexagonal DGGS grid over the Lizard region
+dggs = dgconstruct(area = 120, metric = TRUE, resround = 'nearest')
+liz_boundary = st_bbox(ereefs.sf)
+liz_matrix = matrix(c(
+  liz_boundary[["xmin"]], liz_boundary[["ymin"]],
+  liz_boundary[["xmin"]], liz_boundary[["ymax"]],
+  liz_boundary[["xmax"]], liz_boundary[["ymax"]],
+  liz_boundary[["xmax"]], liz_boundary[["ymin"]],
+  liz_boundary[["xmin"]], liz_boundary[["ymin"]]),
+  ncol = 2, byrow = TRUE)
+liz_shp = st_as_sf(st_sfc(st_polygon(list(liz_matrix))))
+liz_grid = dgshptogrid(dggs, liz_shp)
+
+# assign hexagons to eReefs points and aggregate by hexagon-year
+liz.hexa.sf = st_join(ereefs.sf, liz_grid, join = st_within, left = TRUE) %>% 
+  as.data.frame() %>% 
+  group_by(seqnum, year) %>% 
+  summarise(
+    dic         = mean(dic), 
+    dip         = mean(dip), 
+    din         = mean(din), 
+    chlorophyll = mean(chlorophyll), 
+    .groups     = 'drop'
+  ) %>% 
+  left_join(as.data.frame(liz_grid), by = 'seqnum') %>% 
+  st_as_sf() %>% 
+  filter(!is.na(seqnum))
+
+# join COTS observations to hex grid by year
+x = list()
+for (i in seq_along(years)) {
+  cots.sf.partition = cots.sf %>% filter(year == years[i])
+  liz.sf.partition  = liz.hexa.sf %>% filter(year == years[i])
+  
+  sf.partition = st_join(cots.sf.partition, liz.sf.partition, join = st_within, left = TRUE) %>% 
+    as.data.frame() %>% 
+    select(-geometry, -date, -year.y) %>% 
+    rename(year = year.x) %>% 
+    group_by(seqnum, year) %>% 
+    summarise(
+      ttl_cots   = sum(ttl_cots), 
+      num_tows   = sum(num_tows), 
+      live_coral = mean(live_coral), 
+      .groups    = 'drop'
+    )
+  x[[i]] = sf.partition
+}
+
+# merge back with hex features and compute modeling features
+temp.df = bind_rows(x)
+liz.map.sf = left_join(as.data.frame(liz.hexa.sf), temp.df, by = c('seqnum', 'year')) %>%
+  mutate(mean_cots = ttl_cots / num_tows) %>% 
+  st_as_sf() %>% 
+  filter(!is.na(ttl_cots)) %>% 
+  as.data.frame() %>% 
+  mutate(
+    mean_cots = as.factor(case_when(
+      mean_cots < 0.1              ~ "no.outbreak", 
+      mean_cots >= 0.1 & mean_cots < 0.22 ~ "potential.outbreak", 
+      mean_cots >= 0.22 & mean_cots < 1   ~ "outbreak", 
+      mean_cots >= 1                ~ "severe.outbreak"
+    )),
+    logdin          = log(din + 1), 
+    logdip          = log(dip + 1), 
+    sqrtchlorophyll = sqrt(chlorophyll)
+  )
+
+# predict and evaluate on Lizard Island subset
+liz.predictions = predict(ord_fit, liz.map.sf)
+liz.reference   = liz.map.sf$mean_cots
+
+ord_liz_cm = confusionMatrix(liz.predictions, liz.reference)
+```
+
+# Results 
+## Chosen Model
+Based on our evaluation strategy, the Ordinal Logistic Regression (OREG) model was selected as the final predictive model. While it had the lowest mean sensitivity across the entire Great Barrier Reef (0.285), it demonstrated stronger local performance in the Lizard Island region. As shown in the entire GBR confusion matrix (Figure 2a), the model correctly classified moderate numbers of potential, outbreak, and severe outbreak cases, despite class imbalance. The Lizard Island confusion matrix (Figure 2b) reinforces this: OREG correctly identified examples from every outbreak class, including severe outbreak. Although some misclassifications occurred (e.g., `outbreak` predicted as `potential`), the model preserved meaningful ordinal resolution and did not collapse to the dominant `no outbreak` class. OREG also achieved a specificity of 0.752, indicating a relatively low false positive rate when predicting no outbreak conditions. These metrics, combined with its ability to model ordered categories unlike the other alternatives, made OREG the most appropriate choice for this application.
+
+
+```{r results='asis'}
+#| code-summary: "Confusion Matrices"
+
+set.seed(3888)
+preds <- predict(ord_fit, newdata = liz.map.sf)
+true  <- factor(
+  liz.map.sf$mean_cots,
+  levels = c("no.outbreak", "potential.outbreak", "outbreak", "severe.outbreak"),
+  ordered = TRUE
+)
+
+ord_liz_cm <- confusionMatrix(data = preds, reference = true)
+
+nice_labels <- c(
+  "no.outbreak"         = "No Outbreak",
+  "potential.outbreak"  = "Potential Outbreak",
+  "outbreak"            = "Outbreak",
+  "severe.outbreak"     = "Severe Outbreak"
+)
+
+# create confusion matrices for kable
+cv_cm_tbl  <- as.data.frame.matrix(ord_cm_overall$table)
+liz_cm_tbl <- as.data.frame.matrix(ord_liz_cm$table)
+
+# format kables
+cv_cm_tbl_named <- cv_cm_tbl
+rownames(cv_cm_tbl_named) <- nice_labels[rownames(cv_cm_tbl_named)]
+colnames(cv_cm_tbl_named) <- nice_labels[colnames(cv_cm_tbl_named)]
+
+liz_cm_tbl_named <- liz_cm_tbl
+rownames(liz_cm_tbl_named) <- nice_labels[rownames(liz_cm_tbl_named)]
+colnames(liz_cm_tbl_named) <- nice_labels[colnames(liz_cm_tbl_named)]
+
+# Create kables with nice labels
+cv_kable <- kable(cv_cm_tbl_named, format = "html", digits = 0) %>%
+  add_header_above(c("." = 1, "Figure 2a. Entire GBR Confusion Matrix for OREG Model" = ncol(cv_cm_tbl))) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE)
+
+liz_kable <- kable(liz_cm_tbl_named, format = "html", digits = 0) %>%
+  add_header_above(c("." = 1, "Figure 2b. Lizard Island Confusion Matrix for OREG Model" = ncol(liz_cm_tbl))) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE)
+
+# Combine tables side by side
+side_by_side <- htmltools::tags$table(
+  htmltools::tags$tr(
+    htmltools::tags$td(HTML(as.character(cv_kable)), style = "vertical-align: top; padding-right: 1em;"),
+    htmltools::tags$td(HTML(as.character(liz_kable)), style = "vertical-align: top;")
+  )
+)
+
+cat(as.character(side_by_side))
+```
+
+
+
+```{r}
+# define features for shap plot
+features = c("logdin", "logdip", "sqrtchlorophyll", "dic", "live_coral")
+df_x = df[, features]
+df_y = df$mean_cots
+
+pred_no <- function(object, newdata) {
+  predict(object, newdata = newdata, type = "prob")[, "no.outbreak"]
+}
+
+shap_no <- fastshap::explain(
+  object = ord_fit,
+  X = df_x,
+  pred_wrapper = pred_no,
+  nsim = 100
+)
+
+shap_df <- as.data.frame(shap_no)
+df_x_scaled = as.data.frame(scale(df_x))
+
+# reshape SHAP values for plotting
+n <- nrow(shap_df)
+shap_long <- data.frame(
+  shap_value    = as.vector(as.matrix(shap_df)),
+  feature       = factor(rep(features, each = n), levels = features),
+  feature_value = as.vector(as.matrix(df_x_scaled[features]))
+)
+
+
+# create summary plot for SHAP values
+p = ggplot(shap_long, aes(x = shap_value, y = feature, color = feature_value)) +
+  geom_jitter(alpha = 0.6, height = 0.2) +
+    scale_color_gradient(
+    name   = "Feature value",
+    low    = "blue",    # low values in blue
+    high   = "red",     # high values in red
+    breaks = c(min(shap_long$feature_value),
+               max(shap_long$feature_value)),
+    labels = c("Low", "High")
+  ) + 
+  labs(
+    x     = "SHAP value",
+    y     = "Feature",
+    color = "Feature value",
+    title = "Figure 3. Ordinal Logistic Regression SHAP Summary Plot",
+    subtitle = "for predicting 'no outbreak' class"
+  ) +
+  theme_minimal()
+p
+```
+
+In addition to quantitative performance metrics, we evaluated model interpretability using SHAP values, shown in Figure 3. This summary plot visualises the contribution of each feature to the model's predicted probability of `no outbreak`, with SHAP values near zero indicating little influence and values farther from zero indicating greater impact.
+
+Live coral cover exhibited the strongest influence on predictions, with high values (in red) associated with positive SHAP values, meaning the model was more likely to predict no outbreak when coral cover was high. This aligns with ecological expectations, as healthier reefs with more live coral are less likely to experience COTS outbreaks.
+
+Among nutrient-related variables, DIN and DIP had large, right-skewed SHAP distributions, indicating they consistently lowered the predicted probability of no outbreak when their values were high (i.e. higher nutrient levels pushed the model toward predicting an outbreak). DIC showed a similar pattern, though with slightly more variability across observations.
+
+In contrast, chlorophyll-a had a narrower SHAP value range centered near zero, with less distinction between high and low feature values. This suggests chlorophyll-a was a comparatively weak predictor in the model, despite its ecological relevance as a proxy for primary productivity.
+
+Together, these findings justify the selection of OREG as the final model: it offered good performance in the Lizard Island region, maintained relatively strong specificity, and supported interpretation; these strengths made it well-suited for deployment.
+
+
+## Deployment Process
+
+The model was deployed via an interactive shiny app designed for use by the Great Barrier Reef Marine Park Authority (GBRMPA). As shown in figure 4, the app enables users to input key environmental conditions such as nutrient levels and coral cover, using intuitive slider controls. Based on these inputs, the app dynamically displays the predicted probabilities of each COTS outbreak severity class (no outbreak, potential outbreak, outbreak, and severe outbreak), helping users interpret model outputs in real time.
+
+<div style="text-align: center;">
+  <img src="figures/shiny-model.png" width="70%" alt="Figure 1. Shiny app.">
+  <p><strong>Figure 4.</strong> Shiny app prediction page, with OREG model behind the scenes.</p>
+</div>
+
+From a data science perspective, the app serves as a user-friendly frontend for the ordinal logistic regression model, converting its statistical outputs into probability-based risk predictions. Behind the scenes, inputs are transformed using the same preprocessing steps (log and square-root transformation) used during model training. Predicted probabilities are then displayed as colour-coded bars, making outbreak risk easy to interpret at a glance.
+
+From a marine science perspective, the app operationalises ecological knowledge by mapping environmental drivers to outbreak likelihood. Outbreak severity thresholds follow established AIMS guidelines, enabling domain experts to make decisions using familiar and standardised classification categories.
+
+To illustrate the app’s broader functionality, Appendix B includes additional screenshots from other pages (such as the interactive map view by year) which provide users with spatial and temporal context for their predictions. These visual components not only demonstrate how the model works technically, but also highlight its potential to support targeted, evidence-based reef management. For example, a GBRMPA manager can assess COTS outbreak risk under various scenarios based on historical or current environmental conditions.
+
+# Discussion
+
+To contextualise our model findings, Figure 5 presents observed trends in water quality, coral cover, and COTS abundance over time at Lizard Island, revealing key ecological patterns that help explain outbreak timing and model behaviour.
+
+```{r}
+# we reload ereefs data to take shallowest depth for visualisations
+ereefs.data = expand.grid(long = long, lat = lat, time = timestamps, depth = as.vector(depth)) %>% 
+  dplyr::mutate(
+    dic = as.vector(dic), 
+    dip = as.vector(dip), 
+    din = as.vector(din), 
+    chlorophyll = as.vector(chlorophyll)
+    ) %>% 
+  dplyr::filter(!is.na(din)) %>% 
+  dplyr::group_by(lat, long, time) %>% 
+  dplyr::slice_max(depth) %>% # reload so we can take the shallowest depth
+  dplyr::ungroup() %>% 
+  dplyr::mutate(year = year(time)) %>% 
+  dplyr::rename(date = time)
+
+ereefs.sf = st_as_sf(ereefs.data, coords= c("long", "lat"), crs = 4326)
+
+# filter eReefs data to Lizard Island polygon
+ereefs_liz.sf <- ereefs.sf %>%
+  sf::st_filter(lizard_polygon)
+
+# drop geometry and pivot environmental variables
+env_long <- ereefs_liz.sf %>%
+  sf::st_drop_geometry() %>%
+  select(date, depth, chlorophyll, dic, dip, din) %>%
+  pivot_longer(
+    cols      = c(chlorophyll, dic, dip, din),
+    names_to  = "name",
+    values_to = "value"
+  )
+
+# filter cots data to Lizard Island polygon
+cots_liz.sf <- cots.sf %>%
+  sf::st_filter(lizard_polygon)
+
+# Drop geometry and pivot COTS variables (only within Liz)
+cots_long <- cots_liz.sf %>%
+  sf::st_drop_geometry() %>%
+  filter(date <= as.Date("2018-12-31")) %>%
+  select(date, ttl_cots, live_coral, dead_coral) %>%
+  pivot_longer(
+    cols      = c(ttl_cots, live_coral, dead_coral),
+    names_to  = "name",
+    values_to = "value"
+  ) %>%
+  mutate(depth = 0)
+
+# Combine and set factor levels
+plot_df <- bind_rows(env_long, cots_long) %>%
+  mutate(
+    variable = factor(
+      name,
+      levels = c("dic", "din", "dip", "chlorophyll",
+                 "ttl_cots", "dead_coral", "live_coral")
+    )
+  )
+
+# Define labels
+var_labs <- c(
+  chlorophyll = "Chlorophyll (mg per m3)",
+  dic         = "DIC (mg per m3)",
+  din         = "DIN (mg per m3)",
+  dip         = "DIP (mg per m3)",
+  live_coral  = "Live coral (%)",
+  dead_coral  = "Dead coral (%)",
+  ttl_cots    = "Total COTS"
+)
+
+# Plot all the variables over time
+fig5 <- ggplot(plot_df, aes(x = date, y = value, colour = depth)) +
+  geom_jitter(width = 90, alpha = 0.4, size = 1) +
+  geom_smooth(method = "gam", span = 0.4, se = FALSE, colour = "black") + # smooth line
+  facet_wrap(~ variable, scales = "free_y", ncol = 1,
+             labeller = labeller(variable = var_labs)) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  scale_colour_gradient("Depth (m)", low = "#011e4a", high = "#0a6cff") +
+  labs(title = "Figure 5. Environmental and COTS variables over time at Lizard Island", x = "Year", y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# we save the figure then include it in the report because it needs to be a bit zoomed out!
+# rmd output will not render the figure zoomed out enough in the html 
+ggsave("figures/figure5-highres.png", fig5, width = 10, height = 8, dpi = 300)
+```
+
+<div style="text-align: center;">
+  <img src="figures/figure5-highres.png" width="80%" style="display: block; margin: auto;" alt="Figure 5. Environmental and COTS variables over time at Lizard Island">
+</div>
+
+Figure 5 highlights a clear outbreak peak around 2013-2014, aligning with elevated nutrient levels and phytoplankton activity following Cyclone Yasi in early 2011 (Beeden et al., 2015). The cycle likely triggered substantial river discharge and nutrient runoff, particularly nitrogen and phosphorus, which fuelled the phytoplankton bloom observed in 2011 (Wooldridge & Brodie, 2015; Chandler et al., 2023). This bloom may have enhanced COTS larval survival, consistent with the *‘Terrestrial Run-off Hypothesis’* (Babcock et al., 2020).
+
+However, a two- to three-year lag between nutrient enrichment and outbreak suggests more complex dynamics. Laboratory studies have shown that chlorophyll-a concentrations below 0.5 mg/m3 negatively affect larval development, but larvae can still survive, albeit with slower growth rates (Babcock et al., 2020). This could explain the delayed outbreak response. Interestingly, during the peak outbreak years, chlorophyll levels at 5m depth were lower than expected. One possible explanation is that large, benthic COTS juveniles were consuming phytoplankton in this depth range (Pratchett et al., 2017), reducing observed chlorophyll concentrations. 
+ 
+While chlorophyll-a was a relatively weak predictor overall, as indicated by its low SHAP value range, its directional influence remained ecologically consistent as higher chlorophyll levels were still associated with increased COTS outbreak risk (Wooldridge & Brodie, 2015; SHAP plot in Figure 3). Among nutrients, DIN was the strongest predictor of outbreak risk, likely because it is more immediately bioavailable and rapidly taken up by photosynthetic organisms. In contrast, DIP, while essential, showed weaker predictive power. This is likely due to phosphorus's lower solubility and slower assimilation into the ecosystem (Reed et al., 2016; Søndergaard et al., 2017), as well as potential nitrogen-limitation during key periods.
+
+Some model findings appeared counterintuitive. High DIC levels were associated with lower outbreak risk, despite literature suggesting that DIC supports phytoplankton growth (Tortell & Morel, 2002). Likewise, higher live coral cover predicted lower outbreak risk, when in theory, healthy coral provides a food source for adult COTS. These discrepancies may reflect temporal misalignment between environmental sampling and biological response; for example, coral loss occurring after an outbreak, rather than before. Without finer-resolution temporal data, our model cannot fully disentangle cause and effect.
+
+## Limitations
+
+From a marine science perspective, the biennial COTS survey schedule since 2006 limits the resolution of outbreak detection, potentially missing short-term spikes or localised blooms. Additionally, manta tow surveys are subject to observer variability and can underestimate cryptic or juvenile COTS, especially under poor visibility conditions. These introduce uncertainty into the model’s data.
+
+Another key limitation is the lack of physical oceanographic data. While high nutrient and phytoplankton levels are necessary for outbreaks, larval dispersal is heavily influenced by hydrodynamics. Previous work suggests that ENSO cycles, south-east trade winds, and local current patterns must align with spawning events to effectively transport larvae to suitable settlement sites (Beeden et al., 2015; Castro-Sanguino et al., 2023). These dynamic processes were not captured in our model, potentially limiting its predictive power during complex environmental events.
+
+## Future Work
+Future research should address temporal and observational limitations in existing datasets by incorporating high-frequency, standardised monitoring and autonomous reef surveillance. As climate change continues to increase variability in oceanographic conditions, models must evolve to account for **dynamic and confounding factors** such as ENSO cycles, trade winds and local hydrodynamics which profoundly influence COTS larval settlement and recruitment. 
+
+Within initiation zones like Lizard Island, future approaches must integrate physical oceanography to better capture larval transport pathways, which interact critically with spawning events and phytoplankton pulses. For example, incorporating distance to known COTS settlement sites into the model could improve predictions by accounting for the spatial spread of outbreaks. Additionally, future work could focus on optimising the model’s predictive performance across other reef regions beyond Lizard Island to support broader-scale reef management.
+
+# Conclusion
+This project combined ecological understanding and data science to develop a predictive model for COTS outbreak severity, with a particular focus on the Lizard Island region of the Great Barrier Reef. By prioritising sensitivity to outbreak risk, the selected ordinal logistic regression model provides a valuable tool for early detection and intervention, enabling the GBRMPA to act before outbreaks escalate. While the model performed well in our case study region, several key predictors (such as live coral cover and DIC) produced relationships that countered previous literature findings, likely due to confounding factors and the complex reef ecosystem at Lizard island. Future studies should focus on rectifying limitations by producing models trained on longer datasets with more parameters that potentially influence COTS populations.
+
+# Individual Contributions Table
+| Unikey   | Contributions |
+|----------|---------------------------------------------------------------------------------------------------------------|
+| sdun8682 | Helped with report visualisations, presentation slides, report writing (data-specific parts), enhancing shiny app UI. |
+| eant9634 | Helped with literature review, background and discussion writing (marine), presentation slides and introduction. |
+| csal5712 | Helped with overall marine research/literature review, presentation slides, background, results analysis and discussion. |
+| yuli4070 | Helped with data exploration (visualisation), shiny app framework, presentation slides, and report deployment part. |
+| maon9427 | Helped with model exploration (testing & comparing multiple models), presentation slides, report writing (modeling sections). |
+| lban8671 | Helped with dataset exploration, model selection & interpretability, & back-end shiny app.                    |
+| smag2723 | Helped with data exploration (visualisations), shiny app UI development, report writing and editing (data specific parts). |
+| tpit4758 | Helped with marine research/literature review, marine methodology, presentation slides and discussion writing (limitations & future directions). |
+
+# Appendices
+## Appendix A
+```{r}
+#| code-summary: "Model Evaluation - Specificity and Sensitivity"
+# Extract mean sensitivity and specificity for each model
+model_metrics <- tibble::tibble(
+  Model        = c("Random Forest", "SVM", "Ordinal Regression", "kNN"),
+  Sensitivity  = c(
+    mean(rf_cm_overall$byClass[, "Sensitivity"], na.rm = TRUE),
+    mean(svm_cm_overall$byClass[, "Sensitivity"], na.rm = TRUE),
+    mean(ord_cm_overall$byClass[, "Sensitivity"], na.rm = TRUE),
+    mean(knn_cm_overall$byClass[, "Sensitivity"], na.rm = TRUE)
+  ),
+  Specificity  = c(
+    mean(rf_cm_overall$byClass[, "Specificity"], na.rm = TRUE),
+    mean(svm_cm_overall$byClass[, "Specificity"], na.rm = TRUE),
+    mean(ord_cm_overall$byClass[, "Specificity"], na.rm = TRUE),
+    mean(knn_cm_overall$byClass[, "Specificity"], na.rm = TRUE)
+  )
+)
+
+# Display the table
+kableExtra::kable(model_metrics, format = "html", digits = 3, caption = "Model Performance Comparison (Mean Sensitivity & Specificity)") %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE)
+```
+
+## Appendix B
+<div style="text-align: center;">
+  <img src="figures/shiny-home.png" width="70%" alt="Figure 1. Shiny app.">
+  <p><strong>Figure 1.</strong> Shiny app home screen.</p>
+</div>
+
+<div style="text-align: center;">
+  <img src="figures/shiny-how-to.png" width="70%" alt="Figure 2. Shiny app how to use.">
+  <p><strong>Figure 2.</strong> Shiny app "how to use" page.</p>
+</div>
+
+<div style="text-align: center;">
+  <img src="figures/shiny-map.png" width="70%" alt="Figure 2. Shiny map page.">
+  <p><strong>Figure 3.</strong> Shiny map page.</p>
+</div>
+
+# References 
+
+Allison, N., Cohen I., Finch A.A., Erez, J., & Tudhope, A.W. (2014). Corals concentrate dissolved inorganic carbon to facilitate calcification. Nature communications. (5)5741.
+
+Australian Institute of Marine Science. (2024). Backgrounder: Impact of land runoff | AIMS. Retrieved May 17, 2025, from https://www.aims.gov.au/impact-of-runoff
+
+Babcock, R. C., Plagányi, É. E., Condie, S. A., Westcott, D. A., Fletcher, C. S., Bonin, M. C., & Cameron, D. (2020). Suppressing the next crown-of-thorns outbreak on the Great Barrier Reef. Coral Reefs, 39(5), 1233–1244. https://doi.org/10.1007/s00338-020-01978-8
+
+Baird, M. E., Mongin, M., Skerratt, J., Margvelashvili, N., Tickell, S., Steven, A. D. L., Robillot, C., Ellis, R., Waters, D., Kaniewska, P., & Brodie, J. (2021). Impact of catchment-derived nutrients and sediments on marine water quality on the Great Barrier Reef: An application of the eReefs marine modelling system. Marine Pollution Bulletin, 167, 112297. https://doi.org/10.1016/j.marpolbul.2021.112297
+
+Beeden, R., Maynard, J., Puotinen, M., Marshall, P., Dryden, J., Goldberg, J., & Williams, G. (2015). Impacts and Recovery from Severe Tropical Cyclone Yasi on the Great Barrier Reef. PLOS ONE, 10(4), e0121272. https://doi.org/10.1371/journal.pone.0121272
+
+Brodie, J., Devlin, M., & Lewis, S. (2017). Potential Enhanced Survivorship of Crown of Thorns Starfish Larvae due to Near-Annual Nutrient Enrichment during Secondary Outbreaks on the Central Mid-Shelf of the Great Barrier Reef, Australia. Diversity, 9(1), Article 1. https://doi.org/10.3390/d9010017
+
+Castro-Sanguino, C., Yves-Marie Bozec, Condie, S. A., Fletcher, C. S., Hock, K., Roelfsema, C. M., Westcott, D. A., & Mumby, P. J. (2023). Control efforts of crown‐of‐thorns starfish outbreaks to limit future coral decline across the Great Barrier Reef. Ecosphere, 14(6). https://doi.org/10.1002/ecs2.4580
+
+Chandler, J. F., Burn, D., Caballes, C. F., Doll, P. C., Kwong, S. L. T., Lang, B. J., Pacey, K. I., & Pratchett, M. S. (2023). Increasing densities of Pacific crown-of-thorns starfish (Acanthaster cf. solaris) at Lizard Island, northern Great Barrier Reef, resolved using a novel survey method. Scientific Reports, 13(1), 19306. https://doi.org/10.1038/s41598-023-46749-x
+
+Christophoridis, C., & Fytianos, K. (2006). Conditions Affecting the Release of Phosphorus from Surface Lake Sediments. Journal of Environmental Quality, 35(4), 1181–1192. https://doi.org/10.2134/jeq2005.0213
+
+Cowan, Z.-L., Dworjanyn, S., Caballes, C., & Pratchett, M. (2016). Benthic Predators Influence Microhabitat Preferences and Settlement Success of Crown-of-Thorns Starfish (Acanthaster cf. solaris). Diversity, 8(4), 27. https://doi.org/10.3390/d8040027
+
+Deaker, D. J., & Byrne, M. (2022). Crown of thorns starfish life-history traits contribute to outbreaks, a continuing concern for coral reefs. Emerging Topics in Life Sciences, 6(1). https://doi.org/10.1042/etls20210239
+
+Fabricius, K. E., Okaji, K., & De’ath, G. (2010). Three lines of evidence to link outbreaks of the crown-of-thorns seastar Acanthaster planci to the release of larval food limitation. Coral Reefs, 29(3), 593–605. https://doi.org/10.1007/s00338-010-0628-z
+
+Furnas, M., Devlin, M., Lewis, S., Schaffelke, B., Fabricius, K., & Petus, C. (2013). Assessment of the relative risk of degraded water quality to ecosystems of the Great Barrier Reef: Supporting Studies. 13.
+GBRMPA, AIMS, & CSIRO. (2025). Reef Snapshot: Summer 2024-25. https://elibrary.gbrmpa.gov.au/handle/11017/4116
+
+Kroon, F. J. (2012). Towards ecologically relevant targets for river pollutant loads to the Great Barrier Reef. Marine Pollution Bulletin, 65(4-9), 261–266. https://doi.org/10.1016/j.marpolbul.2011.10.030
+
+Li, M., Sheng, H-X., Dai, M., & Kao, S-J. (2023). Understanding nitrogen dynamics in coral holobionts: comprehensive review of processes, advancements, gaps, and future directions. (10).
+
+Matthews, S. A., Mellin, C., & Pratchett, M. S. (2020). Larval connectivity and water quality explain spatial distribution of crown-of-thorns starfish outbreaks across the Great Barrier Reef. Advances in Marine Biology, 87(1), 223–258. https://doi.org/10.1016/bs.amb.2020.08.007
+
+Miller, I. (2000). Historical patterns and current trends in the broadscale distribution of crown-of-thorns starfish in the northern and central sections of the Great Barrier Reef. Proceedings 9 Th International Coral Reef Symposium, 2, 273–279.
+
+Pratchett, M. S., Caballes, F. C., Rivera-Posada, J., & Sweatman, H. P. A. (2014). Limits to understanding and managing outbreaks of crown-of-thorns starfish (Acanthaster spp.). Oceanography and Marine Biology: An Annual Review, 52, 133–200. https://doi.org/10.1201/b17143-4 
+
+Pratchett, M., Dworjanyn, S., Mos, B., Caballes, C., Thompson, C., & Blowes, S. (2017). Larval Survivorship and Settlement of Crown-of-Thorns Starfish (Acanthaster cf. solaris) at Varying Algal Cell Densities. Diversity, 9(1), 2. https://doi.org/10.3390/d9010002
+
+Patel, F., Zeng, C., Logan, M., & Uthicke, S. (2024). Feeding rates and carbon and nitrogen partitioning in crown-of-thorns sea star larvae (Acanthaster cf. solaris) during development. Marine Biology, 171(2). https://doi.org/10.1007/s00227-023-04377-z
+
+Reed, M. L., Pinckney, J. L., Keppler, C. J., Brock, L. M., Hogan, S. B., & Greenfield, D. I. (2016). The influence of nitrogen and phosphorus on phytoplankton growth and assemblage composition in four coastal, southeastern USA systems. Estuarine, Coastal and Shelf Science, 177, 71–82. https://doi.org/10.1016/j.ecss.2016.05.002
+
+Søndergaard, M., Lauridsen, T. L., Johansson, L. S., & Jeppesen, E. (2017). Nitrogen or phosphorus limitation in lakes and its impact on phytoplankton biomass and submerged macrophyte cover. Hydrobiologia, 795(1), 35–48. https://doi.org/10.1007/s10750-017-3110-x
+
+Tortell, P. D., & Morel, F. M. M. (2002). Sources of inorganic carbon for phytoplankton in the eastern Subtropical and Equatorial Pacific Ocean. Limnology and Oceanography, 47(4), 1012–1022. https://doi.org/10.4319/lo.2002.47.4.1012
+
+Waltham, N. J., Wegscheidl, C., Volders, A., Smart, J. C. R., Hasan, S., Lédée, E., & Waterhouse, J. (2021). Land use conversion to improve water quality in high DIN risk, low-lying sugarcane areas of the Great Barrier Reef catchments. Marine Pollution Bulletin, 167, 112373. https://doi.org/10.1016/j.marpolbul.2021.112373
+
+Walther, B. D., Kingsford, M. J., & McCulloch, M. T. (2013). Environmental Records from Great Barrier Reef Corals: Inshore versus Offshore Drivers. PLoS ONE, 8(10), e77091. https://doi.org/10.1371/journal.pone.0077091
+
+Wolfe, K. & Byrne, M. (2024). Dead foundation species create coral rubble habitat that benefit a resilient pest species, ELSEVIER, Vol. 202, pp. 1-5.
+
+Wooldridge, S. A., & Brodie, J. E. (2015). Environmental triggers for primary outbreaks of crown-of-thorns starfish on the Great Barrier Reef, Australia. Marine Pollution Bulletin, 101(2), 805–815. https://doi.org/10.1016/j.marpolbul.2015.08.049
