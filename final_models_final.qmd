@@ -1,0 +1,569 @@
+---
+title: "final models final"
+format: 
+  html:
+    code-fold: true
+    embed-resources: true
+mainfont: "CMU Serif"
+editor: visual
+---
+
+# Setting up Datasets
+
+## Load Packages
+
+```{r, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(ggplot2)
+library(ncdf4)
+library(CFtime)
+library(sf)
+library(gganimate)
+library(dggridR) 
+library(caret)
+library(randomForest)
+library(e1071)
+library(kableExtra)
+library(iml)
+```
+
+## Load & Clean Datasets
+
+```{r, warning = FALSE, cache= TRUE, message= FALSE, echo= FALSE}
+#| code-summary: "COTS dataset"
+
+
+cots.data = read.csv("cots_data/manta-tow-by-reef.csv") %>% 
+  dplyr::rename(long = LONGITUDE, 
+         lat = LATITUDE, 
+         date = SAMPLE_DATE, 
+         ttl_cots = TOTAL_COTS, 
+         num_tows = TOWS, 
+         mean_cots_per_tow = MEAN_COTS_PER_TOW,
+         live_coral = MEAN_LIVE_CORAL, 
+         soft_coral = MEAN_SOFT_CORAL, 
+         dead_coral = MEAN_DEAD_CORAL) %>% 
+  dplyr::mutate(
+      date = as.Date(date, format = "%Y-%m-%d"), 
+      year = year(date)) %>% 
+  dplyr::select(date, year, long, lat, ttl_cots, mean_cots_per_tow, num_tows, live_coral, soft_coral, dead_coral) %>% 
+  dplyr::filter(year > 2009)
+```
+
+```{r, warning = FALSE, cache= TRUE, message= FALSE, echo= FALSE}
+#| code-summary: "eReefs dataset"
+
+# Import
+ereefs.nc = nc_open("https://thredds.ereefs.aims.gov.au/thredds/dodsC/GBR4_H2p0_B3p1_Cq3b_Dhnd/annual.nc")
+
+# Longitude and Latitude
+lat = ncdf4::ncvar_get(ereefs.nc, "latitude")
+long = ncdf4::ncvar_get(ereefs.nc, "longitude")
+
+# Time
+time = ncdf4::ncvar_get(ereefs.nc, "time")
+tunits = ncdf4::ncatt_get(ereefs.nc, "time", "units")
+cf = CFtime::CFtime(tunits$value, calendar = "standard", time)  # convert time to CFtime class
+timestamps = CFtime::as_timestamp(cf)  # get character-string times
+timestamps = as.Date(timestamps, format = "%Y-%m-%d")  # convert string to date object
+depth = ncdf4::ncvar_get(ereefs.nc, "zc")
+
+# Variables
+dic = ncdf4::ncvar_get(ereefs.nc, "DIC") #Dissolved Inorganic Carbon
+din = ncdf4::ncvar_get(ereefs.nc, "DIN") #Dissolved Inorganic Nitrogen
+dip = ncdf4::ncvar_get(ereefs.nc, "DIP") #Dissolved Inorganic Phosphurus
+chlorophyll = ncdf4::ncvar_get(ereefs.nc, "Chl_a_sum") #Chlorophyll
+
+ereefs.data = expand.grid(long = long, lat = lat, time = timestamps, depth = as.vector(depth)) %>% 
+  dplyr::mutate(
+    dic = as.vector(dic), 
+    dip = as.vector(dip), 
+    din = as.vector(din), 
+    chlorophyll = as.vector(chlorophyll)
+    ) %>% 
+  dplyr::filter(!is.na(din)) %>% 
+  dplyr::group_by(lat, long, time) %>% 
+  dplyr::slice_min(depth) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::mutate(year = year(time)) %>% 
+  dplyr::rename(date = time)
+
+# glimpse(ereefs.data)
+```
+
+## Hexagonal Grid Cells using DGGS for modelling
+
+```{r, warning = FALSE, cache= TRUE, message= FALSE, echo= FALSE}
+#| code-summary: "Building Hexagon Map"
+dggs = dgconstruct(area= 260, metric= TRUE, resround= 'nearest')
+ereefs.sf = st_as_sf(ereefs.data, coords= c("long", "lat"), crs = 4326)
+gbr_boundary = (st_bbox(ereefs.sf))
+
+gbr_boundary_matrix = matrix(c(
+  gbr_boundary[["xmin"]], gbr_boundary[["ymin"]],
+  gbr_boundary[["xmin"]], gbr_boundary[["ymax"]],
+  gbr_boundary[["xmax"]], gbr_boundary[["ymax"]],
+  gbr_boundary[["xmax"]], gbr_boundary[["ymin"]],
+  gbr_boundary[["xmin"]], gbr_boundary[["ymin"]]),
+  ncol = 2, byrow = TRUE)
+
+gbr_shp = st_as_sf(st_sfc(st_polygon(list(gbr_boundary_matrix))))
+
+gbr_grid = dgshptogrid(dggs, gbr_shp)
+
+ereefs.hexa.sf <- st_join(ereefs.sf, gbr_grid, join = st_within, left = TRUE) %>%
+  as.data.frame() %>%
+  select(!geometry) %>%
+  group_by(seqnum, year) %>%
+  summarise(dic = mean(dic),
+            dip = mean(dip), 
+            din = mean(din), 
+            chlorophyll = mean(chlorophyll),
+            .groups = 'drop') %>%
+  left_join(
+    y = as.data.frame(gbr_grid),
+    by = "seqnum"
+  ) %>% 
+  st_as_sf()
+```
+
+```{r, warning = FALSE, cache= TRUE, message= FALSE, echo= FALSE}
+#| code-summary: "Spatial & Temporal Join with COTS dataset"
+cots.sf = st_as_sf(cots.data, coords= c("long", "lat"), crs = 4326)
+years = seq(0:9) + 2009
+x = list() 
+for(i in 1: length(years)){
+  cots.sf.partition = cots.sf %>% filter(year == years[i])
+  ereefs.sf.partition = ereefs.hexa.sf %>% filter(year == years[i])
+  
+  sf.partition = st_join(cots.sf.partition, ereefs.sf.partition, join = st_within, left=TRUE) %>% 
+    as.data.frame() %>% 
+    dplyr::select(!geometry, !date, !year.y) %>% #geometry removed because sites are referenced by their hexagon
+    dplyr::rename(year = year.x) %>% 
+    dplyr::group_by(seqnum, year) %>% 
+    dplyr::summarise(
+      ttl_cots = sum(ttl_cots), 
+      num_tows = sum(num_tows), 
+      live_coral = mean(live_coral), 
+      .groups = 'drop'
+    )
+  
+  x[[i]] = sf.partition
+}
+temp.df = bind_rows(x)
+
+map.sf = dplyr::left_join(
+  x = as.data.frame(ereefs.hexa.sf), 
+  y = temp.df, 
+  by = c("seqnum", 'year')) %>% 
+  dplyr::mutate(mean_cots = ttl_cots/num_tows) %>% 
+  sf::st_as_sf() 
+
+
+
+# glimpse(map.sf)
+```
+**Detailed Explanation of how data is prepared for cleaning:**
+
+1. COTS data from 2010 to 2019 to match the eReefs dataset. note that we only have one observation per year. 
+2. from eReefs variables selected are: Dissolved Inorganic Nitrogen, Dissolved Inorganic Carbon, Dissolved Inorganic Phosphorus, Chlorophyll. 
+3. we `slice_max(depth)`; meaning we take values from a variable at a location and time and the lowest depth that is not NA. 
+4. We build hexagons that are 10km sides, meaning 260km^2 area. 
+5. The data from eReefs is then put into the respective hexagon and we take the average values for nitrogen, carbon, phosphorus, and chlorophyll over each hexagon area. 
+6. The COTS data is put into its respective hexagon and year. When summarising we sum the total cots and number of tows done in that hexagon. We take the average of the live coral percentage. 
+7. We calculate the average number of COTS per hexagon per year with total cots divided by number of tows. 
+8. The average number of COTS per hex per year are binned into four ordinal values: 'no outbreak', 'potential outbreak', 'outbreak' & 'severe outbreak'. in accordance with how the govt. classifies an outbreak: https://www.aims.gov.au/research-topics/monitoring-and-discovery/monitoring-great-barrier-reef/reef-monitoring-sampling-methods
+9. nitrogen & phosphorus have a log transformation e.g. logdin = log(din + 1) (the plus one is to stop 0 going to minus infinity in a log transformation) and chlorophyll has a square root transformation. 
+
+
+
+# Data Exploration
+
+## Animated map of COTS survey sites
+
+```{r, , fig.align="center", cache= TRUE, warning= FALSE, echo = FALSE}
+gbr.plot = map.sf %>% 
+  mutate(
+    cots.abundance = as.factor(case_when(
+        mean_cots < 0.1 ~ "no outbreak", 
+        mean_cots >= 0.1 & mean_cots < 0.22 ~ "potential outbreak", 
+        mean_cots >= 0.22 & mean_cots < 1 ~ "outbreak", 
+        mean_cots >= 1 ~ "severe outbreak"
+    ))) %>% 
+  ggplot() + 
+  geom_sf(aes(fill = cots.abundance)) + 
+  scale_fill_viridis_d(option = 'D', direction = 1, name= "COTS Abundance") + 
+  theme_minimal() + 
+  transition_manual(year) + 
+  labs(title= "Year: {current_frame}")
+
+cots_boundary = (sf::st_bbox(cots.sf))
+zoom.gbr.plot = gbr.plot + 
+  xlim(cots_boundary[['xmin']], cots_boundary[['xmax']]) + 
+  ylim(cots_boundary[['ymin']], cots_boundary[["ymax"]])
+
+gbr.plot
+zoom.gbr.plot
+```
+
+# Prediction Models
+
+**Detailing Model building**: 
+
+1. We examine four different models: Random Forest, Support Vector Machines, KNN from 3 to 15, and an Ordinal Logistic Regression. 
+2. We use Cross-Validation with 5 folds. 
+3. due to class imbalance i.e. 85% of all observations record 'no outbreak', we use smote resampling which is a method that replicates observations from minority classes. 
+3. To find the most suitable model, we prioritise mean sensitivity. meaning that across all four outcomes we are searching for an algorithm that has the highest correct classification rate on average across all four. A consequence is that this increases the specificity (the true negative rate) of the 'no outbreak' class. i.e. the rate at which it correctly diagnoses that there is a potential outbreak or worse is much better. This should be emphasised as really important because we want to be able to detect whether they might be an outbreak. 
+4. we no longer simulate 25 times. 
+
+```{r, warning = FALSE, cache= TRUE, message= FALSE, echo= FALSE} 
+library(caret)
+library(MASS)
+library(klaR)
+library(MLmetrics)
+library(tidyverse)
+set.seed(3888)
+
+df = map.sf %>% 
+  sf::st_drop_geometry() %>% 
+  dplyr::filter(!is.na(mean_cots)) %>% 
+  dplyr::mutate(
+    mean_cots = as.factor(case_when(
+        mean_cots < 0.1 ~ "no.outbreak", 
+        mean_cots >= 0.1 & mean_cots < 0.22 ~ "potential.outbreak", 
+        mean_cots >= 0.22 & mean_cots < 1 ~ "outbreak", 
+        mean_cots >= 1 ~ "severe.outbreak")), 
+    logdin = log(din + 1), 
+    logdip = log(dip + 1), 
+    sqrtchlorophyll = sqrt(chlorophyll)
+  ) 
+
+levels = c(
+    "no.outbreak",
+    "potential.outbreak",
+    "outbreak",
+    "severe.outbreak"
+  )
+
+df$mean_cots <- factor(
+  df$mean_cots,
+  levels = levels,
+  ordered = TRUE
+)
+
+ctrl <- trainControl(
+  method   = "cv",
+  number   = 5,
+  sampling = "smote",   
+  savePrediction = 'final', 
+  classProbs = TRUE, 
+  summaryFunction = multiClassSummary
+)
+
+metric = "Mean_Sensitivity"
+
+rf_fit = train(
+  mean_cots ~ dic + logdin + logdip + sqrtchlorophyll + live_coral,
+  data      = df,
+  method    = "rf",
+  trControl = ctrl,
+  metric = metric,
+  ntree     = 500,
+  maxnodes  = 30,
+  nodesize  = 5
+)
+
+rf_cm_overall = confusionMatrix(
+  factor(rf_fit$pred$pred, levels = levels, ordered = TRUE), 
+  factor(rf_fit$pred$obs, levels = levels, ordered = TRUE)
+)
+
+svm_fit <- train(
+  mean_cots ~ dic + logdin + logdip + sqrtchlorophyll + live_coral,
+  data       = df,
+  method     = "svmRadialWeights",
+  preProcess = c("center","scale"),  # SVM likes scaled data
+  trControl  = ctrl,
+  metric     = metric
+)
+
+svm_cm_overall = confusionMatrix(
+  factor(svm_fit$pred$pred, levels = levels, ordered = TRUE), 
+  factor(svm_fit$pred$obs, levels = levels, ordered = TRUE)
+)
+
+ord_fit <- train(
+  mean_cots ~ dic + logdin + logdip + sqrtchlorophyll + live_coral,
+  data      = df,
+  method    = "polr",                # from MASS::polr
+  trControl = ctrl,
+  metric    = metric
+)
+
+ord_cm_overall = confusionMatrix(
+  factor(ord_fit$pred$pred, levels = levels, ordered = TRUE), 
+  factor(ord_fit$pred$obs, levels = levels, ordered = TRUE)
+)
+
+knn_fit <- train(
+  mean_cots ~ dic + logdin + logdip + sqrtchlorophyll + live_coral,
+  data       = df,
+  method     = "knn",
+  preProcess = c("center","scale"),    # KNN needs scaling
+  tuneGrid   = expand.grid(k = seq(3, 15, by = 2)),
+  trControl  = ctrl,
+  metric     = metric
+)
+
+knn_cm_overall = confusionMatrix(
+  factor(knn_fit$pred$pred, levels = levels, ordered = TRUE), 
+  factor(knn_fit$pred$obs, levels = levels, ordered = TRUE)
+)
+
+print("RANDOM FOREST")
+rf_cm_overall$byClass[,1:2 ]
+print('')
+print("SVM")
+svm_cm_overall$byClass[,1:2 ]
+print('')
+print("ORDINAL REGRESSION")
+ord_cm_overall$byClass[,1:2 ]
+print('')
+print("KNN")
+knn_cm_overall$byClass[,1:2 ]
+
+```
+
+# SHAP PLOTS
+
+**How to read summary plot:**
+
+The colour is shows whether this is a high value or low value of variable. e.g. live_coral goes from red (high) to blue (low). The distance from 0 on the plot is how important it is to predicting positively or negatively for no outbreak. e.g. Nitrogen is centered around 0 meaning it is not important. another example, when chlorophyll is really low, it is has more weight in predicting that there will be a COTS outbreak. when live coral is really low, it is an important factor in determining there will not be an outbreak. 
+
+**How to read individual dependence plots:**
+e.g. the ordinal logistic regression for phosphorus. when the values of phosphorus are really high, they hold more weights in determining that the predict will be no outbreak. 
+
+## PLOTS FOR RANDOM FOREST
+
+
+```{r, warning = FALSE, cache= TRUE, message= FALSE, echo= FALSE} 
+library(DALEX)
+library(fastshap)
+library(ggplot2)
+
+features = c("logdin", "logdip", "sqrtchlorophyll", "dic", "live_coral")
+df_x = df[, features]
+df_y = df$mean_cots
+
+pred_no <- function(object, newdata) {
+  predict(object, newdata = newdata, type = "prob")[, "no.outbreak"]
+}
+
+shap_no <- fastshap::explain(
+  object = rf_fit,
+  X = df_x,
+  pred_wrapper = pred_no,
+  nsim = 100
+)
+
+shap_df <- as.data.frame(shap_no)
+df_x_scaled = as.data.frame(scale(df_x))
+
+n <- nrow(shap_df)
+shap_long <- data.frame(
+  shap_value    = as.vector(as.matrix(shap_df)),
+  feature       = factor(rep(features, each = n), levels = features),
+  feature_value = as.vector(as.matrix(df_x_scaled[features]))
+)
+
+shap.summary.plot = ggplot(shap_long, aes(x = shap_value, y = feature, color = feature_value)) +
+  geom_jitter(alpha = 0.6, height = 0.2) +
+    scale_color_gradient(
+    name   = "Feature value",
+    low    = "blue",
+    high   = "red", 
+    breaks = c(min(shap_long$feature_value),
+               max(shap_long$feature_value)),
+    labels = c("Low", "High")
+  ) + 
+  labs(
+    x     = "SHAP value",
+    y     = "Feature",
+    color = "Feature value",
+    title = "Random Forest SHAP Summary Plot for Prob(no outbreak)"
+  ) +
+  theme_minimal()
+
+shap.summary.plot
+
+
+
+names(shap_df) <- paste0("shap_", features)
+plot_data <- cbind(df, shap_df)
+
+rf.dic.plot = ggplot(plot_data, aes(x = dic, y = shap_dic)) + 
+  geom_point(alpha = 0.6) + 
+  labs(
+    x = "Dissolved Inorganic Carbon", 
+    y = "SHAP value", 
+    title = "Dependence of Dissolved Inorganic Carbon on Prob(no outbreak)"
+  ) + 
+  theme_minimal()
+
+rf.dic.plot
+```
+
+## PLOTS FOR ORDINAL LOGISTIC REGRESSION 
+```{r} 
+library(DALEX)
+library(fastshap)
+library(ggplot2)
+
+features = c("logdin", "logdip", "sqrtchlorophyll", "dic", "live_coral")
+df_x = df[, features]
+df_y = df$mean_cots
+
+pred_no <- function(object, newdata) {
+  predict(object, newdata = newdata, type = "prob")[, "no.outbreak"]
+}
+
+shap_no <- fastshap::explain(
+  object = ord_fit,
+  X = df_x,
+  pred_wrapper = pred_no,
+  nsim = 100
+)
+
+shap_df <- as.data.frame(shap_no)
+df_x_scaled = as.data.frame(scale(df_x))
+
+n <- nrow(shap_df)
+shap_long <- data.frame(
+  shap_value    = as.vector(as.matrix(shap_df)),
+  feature       = factor(rep(features, each = n), levels = features),
+  feature_value = as.vector(as.matrix(df_x_scaled[features]))
+)
+
+
+# beeswarm summary plot
+p = ggplot(shap_long, aes(x = shap_value, y = feature, color = feature_value)) +
+  geom_jitter(alpha = 0.6, height = 0.2) +
+    scale_color_gradient(
+    name   = "Feature value",
+    low    = "blue",    # low values in blue
+    high   = "red",     # high values in red
+    breaks = c(min(shap_long$feature_value),
+               max(shap_long$feature_value)),
+    labels = c("Low", "High")
+  ) + 
+  labs(
+    x     = "SHAP value",
+    y     = "Feature",
+    color = "Feature value",
+    title = "Ordinal Logistic Regression SHAP Summary Plot for Prob(no outbreak)"
+  ) +
+  theme_minimal()
+p
+
+
+names(shap_df) <- paste0("shap_", features)
+plot_data <- cbind(df, shap_df)
+
+ord.logdip.plot = ggplot(plot_data, aes(x = logdip, y = shap_logdip)) + 
+  geom_point(alpha = 0.6) + 
+  labs(
+    x = "Dissolved Inorganic Phosphorus", 
+    y = "SHAP value", 
+    title = "Dependence of Dissolved Inorganic Phosphorus on Prob(no outbreak)"
+  ) + 
+  theme_minimal()
+
+ord.logdip.plot
+```
+
+
+
+## JUNK
+
+```{r} 
+# library(caret)
+# library(MASS)
+# library(klaR)
+# library(MLmetrics)
+# set.seed(3888)
+# 
+# df = map.sf %>% 
+#   sf::st_drop_geometry() %>% 
+#   dplyr::filter(!is.na(mean_cots)) %>% 
+#   dplyr::mutate(
+#     mean_cots = as.factor(case_when(
+#         mean_cots < 0.1 ~ "no.outbreak", 
+#         mean_cots >= 0.1 & mean_cots < 0.22 ~ "potential.outbreak", 
+#         mean_cots >= 0.22 & mean_cots < 1 ~ "outbreak", 
+#         mean_cots >= 1 ~ "severe.outbreak")), 
+#     logdin = log(din + 1), 
+#     logdip = log(dip + 1), 
+#     sqrtchlorophyll = sqrt(chlorophyll)
+#   ) 
+# 
+# levels = c(
+#     "no.outbreak",
+#     "potential.outbreak",
+#     "outbreak",
+#     "severe.outbreak"
+#   )
+# 
+# df$mean_cots <- factor(
+#   df$mean_cots,
+#   levels = levels,
+#   ordered = TRUE
+# )
+# 
+# mySummary <- function(data, lev = NULL, model = NULL) {
+#   # build the confusion matrix
+#   cm <- confusionMatrix(data$pred, data$obs, mode = "everything")
+#   
+#   spec.no.outbreak <- cm$byClass["Class: no.outbreak", "Specificity"]
+#   
+#   sensitivity = c(cm$byClass["Class: potential.outbreak", "Sensitivity"], 
+#                   cm$byClass["Class: outbreak", "Sensitivity"], 
+#                   cm$byClass["Class: severe.outbreak", "Sensitivity"])
+#                   
+#   sensitivity.mean = mean(sensitivity)
+#   
+#   combined <- 0.7 * spec.no.outbreak + 0.3 * sensitivity.mean
+#   
+#   c(Combined = combined)
+# }
+# 
+# ctrl <- trainControl(
+#   method          = "cv",
+#   number          = 5,
+#   sampling        = "smote",
+#   savePredictions = "final",
+#   classProbs      = TRUE,
+#   summaryFunction = mySummary
+# )
+# 
+# metric <- "Combined"
+# 
+# rf2_fit = train(
+#   mean_cots ~ dic + logdin + logdip + sqrtchlorophyll + live_coral,
+#   data      = df,
+#   method    = "rf",
+#   trControl = ctrl,
+#   metric = metric,
+#   ntree     = 500,
+#   maxnodes  = 30,
+#   nodesize  = 5
+# )
+# 
+# rf2_cm_overall = confusionMatrix(
+#   factor(rf2_fit$pred$pred, levels = levels, ordered = TRUE), 
+#   factor(rf2_fit$pred$obs, levels = levels, ordered = TRUE)
+# )
+
+```
+
+
+
